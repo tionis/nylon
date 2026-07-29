@@ -51,6 +51,7 @@ func (s Signal) Wait() {
 }
 
 type VirtualLink struct {
+	sync.RWMutex
 	Edge       state.Pair[bindtest.ChannelEndpoint2, bindtest.ChannelEndpoint2]
 	Latency    time.Duration
 	Jitter     time.Duration
@@ -59,44 +60,35 @@ type VirtualLink struct {
 
 func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEndpoint2, i *InMemoryNetwork) {
 	//fmt.Printf("begin send: %s -> %s\n", from.DstToString(), to.DstToString())
-	if rand.Float64() < v.PacketLoss {
+	v.RLock()
+	packetLoss := v.PacketLoss
+	v.RUnlock()
+	if rand.Float64() < packetLoss {
 		// drop
 		//fmt.Printf("dropped send: %s -> %s\n", from.DstToString(), to.DstToString())
 		return
 	}
 
 	toIdx := i.cfg.IndexOf(i.cfg.Endpoints[to.DstToString()])
-	if v.Latency != 0 {
-		simJitter := rand.Float64() * float64(v.Jitter.Nanoseconds())
-		simLat := v.Latency + time.Duration(simJitter)
-		go func() { // this is quite costly, but should be fine as long as we don't send packets too fast
-			select {
-			case <-i.cfg.Context.Done():
-				return
-			case <-time.After(simLat):
-				//fmt.Printf("delay sent: %s -> %s\n", from.DstToString(), to.DstToString())
-				err := i.binds[toIdx].Send([][]byte{pkt[:len]}, from)
-				if err != nil && !errors.Is(err, net.ErrClosed) {
-					panic(err)
-				}
-			}
-		}()
-	} else {
-		//fmt.Printf("sent: %s -> %s\n", from.DstToString(), to.DstToString())
-		err := i.binds[toIdx].Send([][]byte{pkt[:len]}, from)
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			panic(err)
-		}
+	// Deliver immediately. Link latency is injected into probe results by
+	// probeLatency, avoiding a timer and goroutine for every packet.
+	err := i.binds[toIdx].Send([][]byte{pkt[:len]}, from)
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		panic(err)
 	}
 }
 
 func (v *VirtualLink) WithLatency(lat, jitter time.Duration) *VirtualLink {
+	v.Lock()
+	defer v.Unlock()
 	v.Latency = lat
 	v.Jitter = jitter
 	return v
 }
 
 func (v *VirtualLink) WithPacketLoss(loss float64) *VirtualLink {
+	v.Lock()
+	defer v.Unlock()
 	v.PacketLoss = loss
 	return v
 }
@@ -161,6 +153,29 @@ func (v *VirtualHarness) AddLink(from, to string) *VirtualLink {
 	return link
 }
 
+func (v *VirtualHarness) probeLatency(local state.NodeId, remote netip.AddrPort) (time.Duration, bool) {
+	v.linksMu.RLock()
+	defer v.linksMu.RUnlock()
+
+	var latency time.Duration
+	found := false
+	for _, link := range v.Links {
+		link.RLock()
+		from := link.Edge.V1.DstIPPort()
+		to := link.Edge.V2.DstIPPort()
+		if (to == remote && v.Endpoints[from.String()] == local) ||
+			(from == remote && v.Endpoints[to.String()] == local) {
+			latency += link.Latency
+			if link.Jitter > 0 {
+				latency += time.Duration(rand.Float64() * float64(link.Jitter))
+			}
+			found = true
+		}
+		link.RUnlock()
+	}
+	return latency, found
+}
+
 func (v *VirtualHarness) Start() chan error {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	v.Context = ctx
@@ -198,6 +213,11 @@ func (v *VirtualHarness) Start() chan error {
 			labels := pprof.Labels("nylon node", string(rt.Id))
 			n, err := core.NewNylon(v.Central, v.Local[idx], *v.LogLevel, "", map[string]any{
 				"vnet": vn,
+				core.ProbeLatencyOverrideAuxKey: core.ProbeLatencyOverride(
+					func(_ state.NodeId, endpoint netip.AddrPort) (time.Duration, bool) {
+						return v.probeLatency(rt.Id, endpoint)
+					},
+				),
 			}, state.NylonOptions{DBG_log_wireguard: true}, v.Tunables)
 			if err != nil {
 				errChan <- err

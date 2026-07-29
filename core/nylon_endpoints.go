@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"math/rand/v2"
+	"net/netip"
 	"slices"
 	"time"
 
@@ -19,6 +20,12 @@ type EpPing struct {
 	Peer     state.NodeId
 	Complete func(protocol.EndpointProbeStatus, time.Duration)
 }
+
+const ProbeLatencyOverrideAuxKey = "probe_latency_override"
+
+// ProbeLatencyOverride allows virtual test networks to provide a synthetic RTT
+// without delaying packet delivery. Production callers should leave this unset.
+type ProbeLatencyOverride func(peer state.NodeId, endpoint netip.AddrPort) (time.Duration, bool)
 
 func (n *Nylon) sendEndpointProbes(peer state.NodeId, timeout time.Duration) ([]Future[*protocol.EndpointProbeResult], error) {
 	neigh := n.RouterState.GetNeighbour(peer)
@@ -199,6 +206,11 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 	}
 	receivedAt := time.Now()
 	latency := receivedAt.Sub(health.TimeSent)
+	if override, ok := n.AuxConfig[ProbeLatencyOverrideAuxKey].(ProbeLatencyOverride); ok {
+		if syntheticLatency, found := override(node, ep.DstIPPort()); found {
+			latency = syntheticLatency
+		}
+	}
 	health.Complete(protocol.EndpointProbeStatus_ENDPOINT_PROBE_REPLIED, latency)
 
 	// check if link exists
