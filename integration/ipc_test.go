@@ -5,7 +5,9 @@ package integration
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"os"
 	"testing"
@@ -38,6 +40,33 @@ func setupTwoNodeHarness(t *testing.T) (*VirtualHarness, chan error) {
 	vh.AddLink(b2, a1)
 	errs := vh.Start()
 	return vh, errs
+}
+
+func waitForActiveNeighbour(t *testing.T, n *core.Nylon, peer state.NodeId, errs <-chan error) {
+	t.Helper()
+	timeout := time.NewTimer(12 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		active, err := core.NewDispatchFuture(n, func() (bool, error) {
+			neighbour := n.RouterState.GetNeighbour(peer)
+			return neighbour != nil && neighbour.BestEndpoint() != nil, nil
+		}).Await(ctx)
+		cancel()
+		require.NoError(t, err)
+		if active {
+			return
+		}
+		select {
+		case err := <-errs:
+			t.Fatal(err)
+		case <-ticker.C:
+		case <-timeout.C:
+			t.Fatalf("timed out waiting for neighbour %q to become active", peer)
+		}
+	}
 }
 
 func ipcCall(t *testing.T, n *core.Nylon, req *protocol.IpcRequest) *protocol.IpcResponse {
@@ -99,6 +128,7 @@ func TestIPCStatus(t *testing.T) {
 func TestIPCProbeReportsTimeout(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	vh := &VirtualHarness{}
+	vh.LogLevel = new(slog.LevelError)
 	a1 := "192.168.52.1:1234"
 	b1 := "192.168.52.2:1234"
 	vh.NewNode("a", "10.0.0.1/32")
@@ -130,6 +160,69 @@ func TestIPCProbeReportsTimeout(t *testing.T) {
 		t.Fatal(err)
 	default:
 	}
+}
+
+func TestIPCProbeReportsSyntheticMetricLatency(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	vh := &VirtualHarness{}
+	vh.LogLevel = new(slog.LevelError)
+	a1 := "192.168.53.1:1234"
+	b1 := "192.168.53.2:1234"
+	vh.NewNode("a", "10.0.0.1/32")
+	vh.NewNode("b", "10.0.0.2/32")
+	vh.Central.Graph = []string{"a, b"}
+	vh.Endpoints = map[string]state.NodeId{a1: "a", b1: "b"}
+	vh.AddLink(a1, b1).WithMetricLatency(7*time.Millisecond, 0)
+	vh.AddLink(b1, a1).WithMetricLatency(11*time.Millisecond, 0)
+	errs := vh.Start()
+	defer vh.Stop()
+
+	a := vh.Nylons[vh.IndexOf("a")].Load()
+	waitForActiveNeighbour(t, a, "b", errs)
+	resp := ipcCall(t, a, &protocol.IpcRequest{
+		Request: &protocol.IpcRequest_Probe{
+			Probe: &protocol.ProbeRequest{PeerId: "b", TimeoutMs: 1_000},
+		},
+	})
+
+	require.True(t, resp.Ok, resp.Error)
+	results := resp.GetProbe().GetResults()
+	require.Len(t, results, 1)
+	assert.Equal(t, protocol.EndpointProbeStatus_ENDPOINT_PROBE_REPLIED, results[0].Status)
+	assert.Equal(t, int64(18*time.Millisecond), results[0].LatencyNs)
+}
+
+func TestIPCProbeTimesOutOnDeliveryLatency(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	vh := &VirtualHarness{}
+	vh.LogLevel = new(slog.LevelError)
+	a1 := "192.168.54.1:1234"
+	b1 := "192.168.54.2:1234"
+	vh.NewNode("a", "10.0.0.1/32")
+	vh.NewNode("b", "10.0.0.2/32")
+	vh.Central.Graph = []string{"a, b"}
+	vh.Endpoints = map[string]state.NodeId{a1: "a", b1: "b"}
+	outbound := vh.AddLink(a1, b1)
+	inbound := vh.AddLink(b1, a1)
+	errs := vh.Start()
+	defer vh.Stop()
+
+	a := vh.Nylons[vh.IndexOf("a")].Load()
+	waitForActiveNeighbour(t, a, "b", errs)
+	outbound.WithDeliveryLatency(50*time.Millisecond, 0)
+	inbound.WithDeliveryLatency(50*time.Millisecond, 0)
+
+	resp := ipcCall(t, a, &protocol.IpcRequest{
+		Request: &protocol.IpcRequest_Probe{
+			Probe: &protocol.ProbeRequest{PeerId: "b", TimeoutMs: 10},
+		},
+	})
+
+	require.True(t, resp.Ok, resp.Error)
+	results := resp.GetProbe().GetResults()
+	require.Len(t, results, 1)
+	assert.Equal(t, protocol.EndpointProbeStatus_ENDPOINT_PROBE_TIMEOUT, results[0].Status)
+	assert.Zero(t, results[0].LatencyNs)
 }
 
 func TestIPCReloadConfig(t *testing.T) {

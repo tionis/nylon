@@ -3,14 +3,34 @@
 package integration
 
 import (
-	"fmt"
+	"context"
+	"log/slog"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/encodeous/nylon/core"
 	"github.com/encodeous/nylon/state"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
+
+type routeSnapshot struct {
+	route state.SelRoute
+	found bool
+}
+
+func selectedRoute(n *core.Nylon, prefix netip.Prefix) (state.SelRoute, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	snapshot, err := core.NewDispatchFuture(n, func() (routeSnapshot, error) {
+		route, found := n.RouterState.Routes[prefix]
+		return routeSnapshot{route: route, found: found}, nil
+	}).Await(ctx)
+	return snapshot.route, snapshot.found, err
+}
 
 func TestOptimalConvergence(t *testing.T) {
 	defer goleak.VerifyNone(t)
@@ -20,6 +40,7 @@ func TestOptimalConvergence(t *testing.T) {
 	tunables.MinimumConfidenceWindow /= 5
 
 	vh := &VirtualHarness{}
+	vh.LogLevel = new(slog.LevelError)
 	vh.Tunables = &tunables
 	a1 := "192.168.1.1:1234"
 	vh.NewNode("a", "10.0.0.1/32")
@@ -36,67 +57,78 @@ func TestOptimalConvergence(t *testing.T) {
 		c1: "c",
 	}
 	// a <-10-> b
-	vh.AddLink(a1, b1).WithLatency(10*time.Millisecond, 0)
-	vh.AddLink(b1, a1).WithLatency(10*time.Millisecond, 0)
+	vh.AddLink(a1, b1).WithMetricLatency(10*time.Millisecond, 0)
+	vh.AddLink(b1, a1).WithMetricLatency(10*time.Millisecond, 0)
 
 	// c <-50-> a
-	vh.AddLink(a1, c1).WithLatency(50*time.Millisecond, 0)
-	vh.AddLink(c1, a1).WithLatency(50*time.Millisecond, 0)
+	vh.AddLink(a1, c1).WithMetricLatency(50*time.Millisecond, 0)
+	vh.AddLink(c1, a1).WithMetricLatency(50*time.Millisecond, 0)
 
 	errs := vh.Start()
+	defer vh.Stop()
 
-	vn := vh.Net
+	a := vh.Nylons[vh.IndexOf("a")].Load()
+	cPrefix := netip.MustParsePrefix("10.0.0.3/32")
+	require.Eventually(t, func() bool {
+		route, found, err := selectedRoute(a, cPrefix)
+		return err == nil && found && route.Nh == "c" && route.Metric == 100_005
+	}, 30*time.Second, 25*time.Millisecond, "A never selected the initial direct route to C")
 
-	conv1 := NewSignal() // first stage convergence: c <-50-> a <-10-> b
-	conv2 := NewSignal() // second stage convergence: a <-10-> b <-10-> c
-	success := NewSignal()
+	initial, found, err := selectedRoute(a, cPrefix)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, state.NodeId("c"), initial.Nh)
+	assert.Equal(t, state.NodeId("c"), initial.NodeId)
+	assert.Equal(t, uint32(100_005), initial.Metric)
 
-	go func() {
-		conv1.Wait()
+	// Add the faster a <-10-> b <-10-> c path.
+	vh.AddLink(b1, c1).WithMetricLatency(10*time.Millisecond, 0)
+	vh.AddLink(c1, b1).WithMetricLatency(10*time.Millisecond, 0)
 
-		fmt.Printf("---- Stage 1 convergence reached ----\n")
+	require.Eventually(t, func() bool {
+		route, found, err := selectedRoute(a, cPrefix)
+		return err == nil && found && route.Nh == "b" && route.Metric == 40_010
+	}, 30*time.Second, 25*time.Millisecond, "A never switched to the lower-cost route through B")
 
-		// b <-10-> c
-		vh.AddLink(b1, c1).WithLatency(10*time.Millisecond, 0)
-		vh.AddLink(c1, b1).WithLatency(10*time.Millisecond, 0)
+	converged, found, err := selectedRoute(a, cPrefix)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, state.NodeId("b"), converged.Nh)
+	assert.Equal(t, state.NodeId("c"), converged.NodeId)
+	assert.Equal(t, uint32(40_010), converged.Metric)
 
-	}()
-
-	vn.TransitHandler = func(node state.NodeId, src, dst netip.Addr, data []byte) bool {
-		if node == "b" && src.String() == "10.0.0.1" && dst.String() == "10.0.0.3" && data[0] == 222 && conv1.Triggered() {
-			// this means the network has reached the optimal path
-			conv2.Trigger()
+	transited := make(chan struct{})
+	arrived := make(chan struct{})
+	var transitOnce, arrivalOnce sync.Once
+	vh.Net.TransitHandler = func(node state.NodeId, src, dst netip.Addr, data []byte) bool {
+		if node == "b" && src.String() == "10.0.0.1" && dst.String() == "10.0.0.3" && len(data) != 0 && data[0] == 222 {
+			transitOnce.Do(func() { close(transited) })
 		}
-		return false // don't intercept the packet
+		return false
 	}
-	vn.SelfHandler = func(node state.NodeId, src, dst netip.Addr, data []byte) bool {
-		if node == "c" && src.String() == "10.0.0.1" && dst.String() == "10.0.0.3" && data[0] == 222 {
-			conv1.Trigger()
-			if conv2.Triggered() {
-				success.Trigger()
-			}
+	vh.Net.SelfHandler = func(node state.NodeId, src, dst netip.Addr, data []byte) bool {
+		if node == "c" && src.String() == "10.0.0.1" && dst.String() == "10.0.0.3" && len(data) != 0 && data[0] == 222 {
+			arrivalOnce.Do(func() { close(arrived) })
 		}
 		return true
 	}
 
-	go func() {
-		for {
-			select {
-			case <-vh.Context.Done():
-				return
-			case <-time.After(100 * time.Millisecond):
-				vn.Send("a", "10.0.0.1", "10.0.0.3", []byte{222}, 64)
-			}
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for transited != nil || arrived != nil {
+		select {
+		case <-transited:
+			transited = nil
+		case <-arrived:
+			arrived = nil
+		case <-ticker.C:
+			vh.Net.Send("a", "10.0.0.1", "10.0.0.3", []byte{222}, 64)
+		case err := <-errs:
+			t.Fatal(err)
+		case <-timeout.C:
+			t.Fatal("selected route did not carry traffic through B to C")
 		}
-	}()
-
-	select {
-	case <-success:
-		t.Log("Reached optimal!")
-	case <-time.After(200 * time.Second):
-		t.Error("Timed out waiting for ping")
-	case err := <-errs:
-		t.Error(err)
 	}
-	vh.Stop()
 }

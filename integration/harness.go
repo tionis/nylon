@@ -26,43 +26,43 @@ import (
 	"github.com/encodeous/nylon/state"
 )
 
-type Signal chan bool
-
-func NewSignal() Signal {
-	return make(chan bool)
-}
-func (s Signal) Trigger() {
-	select {
-	case <-s:
-	default:
-		close(s)
-	}
-}
-func (s Signal) Triggered() bool {
-	select {
-	case <-s:
-		return true
-	default:
-		return false
-	}
-}
-func (s Signal) Wait() {
-	<-s
-}
-
 type VirtualLink struct {
-	sync.RWMutex
-	Edge       state.Pair[bindtest.ChannelEndpoint2, bindtest.ChannelEndpoint2]
-	Latency    time.Duration
-	Jitter     time.Duration
-	PacketLoss float64
+	mu sync.Mutex
+
+	Edge state.Pair[bindtest.ChannelEndpoint2, bindtest.ChannelEndpoint2]
+
+	metricLatency   time.Duration
+	metricJitter    time.Duration
+	deliveryLatency time.Duration
+	deliveryJitter  time.Duration
+	packetLoss      float64
+
+	metricJitterSample   func() float64
+	deliveryJitterSample func() float64
+}
+
+func jitteredDuration(latency, jitter time.Duration, sample func() float64) time.Duration {
+	if jitter <= 0 {
+		return latency
+	}
+	return latency + time.Duration(sample()*float64(jitter))
+}
+
+func (v *VirtualLink) deliveryConditions() (time.Duration, float64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return jitteredDuration(v.deliveryLatency, v.deliveryJitter, v.deliveryJitterSample), v.packetLoss
+}
+
+func (v *VirtualLink) sampledMetricLatency() time.Duration {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return jitteredDuration(v.metricLatency, v.metricJitter, v.metricJitterSample)
 }
 
 func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEndpoint2, i *InMemoryNetwork) {
 	//fmt.Printf("begin send: %s -> %s\n", from.DstToString(), to.DstToString())
-	v.RLock()
-	packetLoss := v.PacketLoss
-	v.RUnlock()
+	deliveryLatency, packetLoss := v.deliveryConditions()
 	if rand.Float64() < packetLoss {
 		// drop
 		//fmt.Printf("dropped send: %s -> %s\n", from.DstToString(), to.DstToString())
@@ -70,26 +70,65 @@ func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEnd
 	}
 
 	toIdx := i.cfg.IndexOf(i.cfg.Endpoints[to.DstToString()])
-	// Deliver immediately. Link latency is injected into probe results by
-	// probeLatency, avoiding a timer and goroutine for every packet.
-	err := i.binds[toIdx].Send([][]byte{pkt[:len]}, from)
-	if err != nil && !errors.Is(err, net.ErrClosed) {
-		panic(err)
+	send := func() {
+		err := i.binds[toIdx].Send([][]byte{pkt[:len]}, from)
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			panic(err)
+		}
 	}
+	if deliveryLatency <= 0 {
+		send()
+		return
+	}
+	go func() {
+		timer := time.NewTimer(deliveryLatency)
+		defer timer.Stop()
+		select {
+		case <-i.cfg.Context.Done():
+		case <-timer.C:
+			send()
+		}
+	}()
 }
 
-func (v *VirtualLink) WithLatency(lat, jitter time.Duration) *VirtualLink {
-	v.Lock()
-	defer v.Unlock()
-	v.Latency = lat
-	v.Jitter = jitter
+// WithMetricLatency sets the one-way cost reported by probes without delaying
+// packet delivery.
+func (v *VirtualLink) WithMetricLatency(latency, jitter time.Duration) *VirtualLink {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.metricLatency = latency
+	v.metricJitter = jitter
+	return v
+}
+
+// WithDeliveryLatency delays actual packets. Most routing tests should use
+// WithMetricLatency instead so they remain fast and deterministic.
+func (v *VirtualLink) WithDeliveryLatency(latency, jitter time.Duration) *VirtualLink {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.deliveryLatency = latency
+	v.deliveryJitter = jitter
 	return v
 }
 
 func (v *VirtualLink) WithPacketLoss(loss float64) *VirtualLink {
-	v.Lock()
-	defer v.Unlock()
-	v.PacketLoss = loss
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.packetLoss = loss
+	return v
+}
+
+func (v *VirtualLink) withMetricJitterSampler(sample func() float64) *VirtualLink {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.metricJitterSample = sample
+	return v
+}
+
+func (v *VirtualLink) withDeliveryJitterSampler(sample func() float64) *VirtualLink {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.deliveryJitterSample = sample
 	return v
 }
 
@@ -102,6 +141,7 @@ type VirtualHarness struct {
 	Nylons           []atomic.Pointer[core.Nylon]
 	Links            []*VirtualLink
 	linksMu          sync.RWMutex
+	nextLinkID       uint64
 	Endpoints        map[string]state.NodeId
 	UntrackedRouting bool
 	LogLevel         *slog.Level
@@ -142,38 +182,65 @@ func (v *VirtualHarness) NewNode(id state.NodeId, virtPrefix string) {
 }
 
 func (v *VirtualHarness) AddLink(from, to string) *VirtualLink {
-	link := &VirtualLink{}
-	link.Edge = state.Pair[bindtest.ChannelEndpoint2, bindtest.ChannelEndpoint2]{
-		V1: bindtest.ChannelEndpoint2(netip.MustParseAddrPort(from)),
-		V2: bindtest.ChannelEndpoint2(netip.MustParseAddrPort(to)),
-	}
 	v.linksMu.Lock()
+	linkID := v.nextLinkID
+	v.nextLinkID++
+	metricRNG := rand.New(rand.NewPCG(linkID, 0x6d6574726963))
+	deliveryRNG := rand.New(rand.NewPCG(linkID, 0x64656c6976657279))
+	link := &VirtualLink{
+		Edge: state.Pair[bindtest.ChannelEndpoint2, bindtest.ChannelEndpoint2]{
+			V1: bindtest.ChannelEndpoint2(netip.MustParseAddrPort(from)),
+			V2: bindtest.ChannelEndpoint2(netip.MustParseAddrPort(to)),
+		},
+		metricJitterSample:   metricRNG.Float64,
+		deliveryJitterSample: deliveryRNG.Float64,
+	}
 	v.Links = append(v.Links, link)
 	v.linksMu.Unlock()
 	return link
 }
 
-func (v *VirtualHarness) probeLatency(local state.NodeId, remote netip.AddrPort) (time.Duration, bool) {
+func (v *VirtualHarness) endpointForNode(node state.NodeId) (bindtest.ChannelEndpoint2, bool) {
+	endpoints := make([]string, 0)
+	for endpoint, owner := range v.Endpoints {
+		if owner == node {
+			endpoints = append(endpoints, endpoint)
+		}
+	}
+	if len(endpoints) == 0 {
+		return bindtest.ChannelEndpoint2(netip.AddrPort{}), false
+	}
+	slices.Sort(endpoints)
+	return bindtest.ChannelEndpoint2(netip.MustParseAddrPort(endpoints[0])), true
+}
+
+func (v *VirtualHarness) probeLatency(local, peer state.NodeId, remote netip.AddrPort) (time.Duration, bool) {
+	if v.Endpoints[remote.String()] != peer {
+		return 0, false
+	}
+	localEndpoint, ok := v.endpointForNode(local)
+	if !ok {
+		return 0, false
+	}
+
 	v.linksMu.RLock()
 	defer v.linksMu.RUnlock()
 
-	var latency time.Duration
-	found := false
+	var outbound, inbound *VirtualLink
 	for _, link := range v.Links {
-		link.RLock()
 		from := link.Edge.V1.DstIPPort()
 		to := link.Edge.V2.DstIPPort()
-		if (to == remote && v.Endpoints[from.String()] == local) ||
-			(from == remote && v.Endpoints[to.String()] == local) {
-			latency += link.Latency
-			if link.Jitter > 0 {
-				latency += time.Duration(rand.Float64() * float64(link.Jitter))
-			}
-			found = true
+		if outbound == nil && from == localEndpoint.DstIPPort() && to == remote {
+			outbound = link
 		}
-		link.RUnlock()
+		if inbound == nil && from == remote && to == localEndpoint.DstIPPort() {
+			inbound = link
+		}
 	}
-	return latency, found
+	if outbound == nil || inbound == nil {
+		return 0, false
+	}
+	return outbound.sampledMetricLatency() + inbound.sampledMetricLatency(), true
 }
 
 func (v *VirtualHarness) Start() chan error {
@@ -191,10 +258,9 @@ func (v *VirtualHarness) Start() chan error {
 	vn.readyCond = sync.NewCond(&sync.Mutex{})
 	// pick the first endpoint specified for each node
 	vn.EpOutMapping = func(curNode state.NodeId, to bindtest.ChannelEndpoint2) bindtest.ChannelEndpoint2 {
-		for k, x := range v.Endpoints {
-			if x == curNode {
-				return bindtest.ChannelEndpoint2(netip.MustParseAddrPort(k))
-			}
+		endpoint, ok := v.endpointForNode(curNode)
+		if ok {
+			return endpoint
 		}
 		panic(fmt.Sprintf("no endpoint found for node %v", curNode))
 	}
@@ -214,8 +280,8 @@ func (v *VirtualHarness) Start() chan error {
 			n, err := core.NewNylon(v.Central, v.Local[idx], *v.LogLevel, "", map[string]any{
 				"vnet": vn,
 				core.ProbeLatencyOverrideAuxKey: core.ProbeLatencyOverride(
-					func(_ state.NodeId, endpoint netip.AddrPort) (time.Duration, bool) {
-						return v.probeLatency(rt.Id, endpoint)
+					func(peer state.NodeId, endpoint netip.AddrPort) (time.Duration, bool) {
+						return v.probeLatency(rt.Id, peer, endpoint)
 					},
 				),
 			}, state.NylonOptions{DBG_log_wireguard: true}, v.Tunables)

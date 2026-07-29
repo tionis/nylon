@@ -27,6 +27,15 @@ const ProbeLatencyOverrideAuxKey = "probe_latency_override"
 // without delaying packet delivery. Production callers should leave this unset.
 type ProbeLatencyOverride func(peer state.NodeId, endpoint netip.AddrPort) (time.Duration, bool)
 
+func (n *Nylon) resolveProbeLatency(peer state.NodeId, endpoint netip.AddrPort, measured time.Duration) time.Duration {
+	if override, ok := n.AuxConfig[ProbeLatencyOverrideAuxKey].(ProbeLatencyOverride); ok {
+		if syntheticLatency, found := override(peer, endpoint); found {
+			return syntheticLatency
+		}
+	}
+	return measured
+}
+
 func (n *Nylon) sendEndpointProbes(peer state.NodeId, timeout time.Duration) ([]Future[*protocol.EndpointProbeResult], error) {
 	neigh := n.RouterState.GetNeighbour(peer)
 	if neigh == nil {
@@ -205,12 +214,7 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 		return
 	}
 	receivedAt := time.Now()
-	latency := receivedAt.Sub(health.TimeSent)
-	if override, ok := n.AuxConfig[ProbeLatencyOverrideAuxKey].(ProbeLatencyOverride); ok {
-		if syntheticLatency, found := override(node, ep.DstIPPort()); found {
-			latency = syntheticLatency
-		}
-	}
+	latency := n.resolveProbeLatency(node, ep.DstIPPort(), receivedAt.Sub(health.TimeSent))
 	health.Complete(protocol.EndpointProbeStatus_ENDPOINT_PROBE_REPLIED, latency)
 
 	// check if link exists
